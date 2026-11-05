@@ -1,0 +1,188 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  NOMAD_VERSION: "2.1.1"
+  REGISTRY: ghcr.io
+
+jobs:
+  lint:
+    name: Lint, validate and test image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: app/Dockerfile
+          failure-threshold: warning
+
+      - name: Lint GitHub Actions workflow
+        uses: raven-actions/actionlint@v2
+
+      - name: Lint shell scripts
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck -x scripts/*.sh
+
+      - name: Install Nomad CLI
+        run: ./scripts/install-nomad.sh
+
+      - name: Add Nomad to PATH
+        run: echo "$PWD/.tools/bin" >> "$GITHUB_PATH"
+
+      - name: Check Nomad formatting
+        run: nomad fmt -check -recursive nomad/
+
+      - name: Render Nomad job specifications
+        run: |
+          set -euo pipefail
+          for f in nomad/*.nomad.hcl nomad/observability/*.nomad.hcl; do
+            echo "==> $f"
+            nomad job run -output "$f" >/dev/null
+          done
+
+      - name: Compute test build metadata
+        id: buildmeta
+        run: echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build test image
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: app/Dockerfile
+          push: false
+          load: true
+          tags: nginx-nomad-pipeline:ci-test
+          build-args: |
+            BUILD_ID=ci-test-${{ github.run_number }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.buildmeta.outputs.date }}
+            BUILD_REPOSITORY=${{ github.repository }}
+
+      - name: Smoke-test image
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 127.0.0.1:18080:8080 nginx-nomad-pipeline:ci-test
+          trap 'docker rm -f smoke >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18080/ | grep -F "Md Faiz Farooqui"
+          curl -fsS http://127.0.0.1:18080/ | grep -F "2026-11-05"
+          curl -fsS http://127.0.0.1:18080/build-info.json |
+            jq -e '.build_id == "ci-test-${{ github.run_number }}"'
+
+  build-push:
+    name: Build and push image
+    needs: lint
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      build_id: ${{ steps.vars.outputs.build_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image and build metadata
+        id: vars
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY,,}"
+          sha_short="${GITHUB_SHA::7}"
+          {
+            echo "repo_lc=${repo}"
+            echo "image=${REGISTRY}/${repo}:sha-${sha_short}"
+            echo "build_id=${GITHUB_RUN_NUMBER}-${sha_short}"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: app/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}
+            ${{ env.REGISTRY }}/${{ steps.vars.outputs.repo_lc }}:latest
+          build-args: |
+            BUILD_ID=${{ steps.vars.outputs.build_id }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.vars.outputs.build_date }}
+            BUILD_REPOSITORY=${{ github.repository }}
+          provenance: true
+          sbom: true
+
+  deploy:
+    name: Deploy to Nomad
+    needs: [lint, build-push]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, nomad]
+    env:
+      NOMAD_ADDR: ${{ secrets.NOMAD_ADDR || 'http://127.0.0.1:4646' }}
+      NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nomad CLI
+        run: ./scripts/install-nomad.sh
+
+      - name: Add Nomad to PATH
+        run: echo "$PWD/.tools/bin" >> "$GITHUB_PATH"
+
+      - name: Validate job against live Nomad
+        run: |
+          nomad job validate \
+            -var "image=${{ needs.build-push.outputs.image }}" \
+            nomad/nginx.nomad.hcl
+
+      - name: Deploy
+        env:
+          IMAGE: ${{ needs.build-push.outputs.image }}
+          IMAGE_PULL_POLICY: always
+        run: ./scripts/deploy.sh
+
+      - name: Smoke-test deployment
+        env:
+          EXPECTED_BUILD_ID: ${{ needs.build-push.outputs.build_id }}
+          URL: http://127.0.0.1:8080
+        run: ./scripts/smoke-test.sh

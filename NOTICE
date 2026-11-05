@@ -1,0 +1,29 @@
+This repository vendors and modifies a reference NGINX application.
+
+Upstream project
+----------------
+Repository: https://github.com/nginxinc/NGINX-Demos
+Path:       kubernetes-demo-nginx-ingress-resources/apps/coffee
+Commit:     611fa05748a4031841e5607cd3069288b0aa9973
+License:    Apache License 2.0 (see LICENSE)
+Copyright:  Copyright 2020-2024 NGINX, Inc.
+
+Vendored files
+--------------
+- app/index.html   (derived from upstream index.html)
+- app/hello.conf   (derived from upstream hello.conf)
+- app/Dockerfile   (derived from upstream Dockerfile)
+
+Modifications
+-------------
+- Replaced the Kubernetes Deployment, Service and HPA manifests with the
+  HashiCorp Nomad job specification in nomad/nginx.nomad.hcl.
+- Added the assessor name, assessment date, build identifier, Git commit and
+  build timestamp to index.html, injected at image build time.
+- Added /healthz and /build-info.json endpoints, a container HEALTHCHECK and
+  image provenance labels to the Dockerfile.
+- Updated the base image tag and pinned dependencies.
+- Added build, test, deployment, CI and observability automation.
+
+The upstream project had no separate NOTICE file; the Apache-2.0 LICENSE from
+the upstream repository is reproduced at the root of this repository.

@@ -1,0 +1,42 @@
+# Source control / IDE metadata
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.editorconfig
+.DS_Store
+Thumbs.db
+*~
+*.swp
+
+# Local tooling
+.tools/
+bin/
+.nomad/
+.nomad-dev.log
+.nomad-dev.pid
+
+# Build and test artifacts
+dist/
+build/
+coverage/
+*.log
+*.tmp
+tmp/
+
+# Local configuration, secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.jks
+secrets/
+
+# Terraform/state (not used, kept out defensively)
+*.tfstate
+*.tfstate.*
+.terraform/
